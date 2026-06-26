@@ -1,203 +1,118 @@
+import streamlit as st
+import dlisio
+import lasio
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import matplotlib.ticker as ticker
-from scipy.stats import skew, probplot
+import io
+import tempfile
+from pathlib import Path
+import zipfile
+from datetime import datetime
+import re
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# ==========================================
-# 1. Simulation Setup
-# ==========================================
-iterations = 100000
-np.random.seed(42)
+# إعداد الصفحة
+st.set_page_config(page_title="PetroLog Converter", layout="wide")
 
-rock_volume = 80576000 * 0.0008107132
+st.title("🛢️ PetroLog Converter Pro")
+st.markdown("تحويل ملفات LIS/DLIS إلى LAS بدقة عالية مع معالجة ملفات DIPLOG")
 
-# Distributions
-ntg = np.random.triangular(0.17, 0.30, 0.42, iterations)
-porosity = np.random.triangular(0.09, 0.12, 0.18, iterations)
-sw = np.random.triangular(0.30, 0.40, 0.48, iterations)
-rf = np.random.triangular(0.16, 0.18, 0.22, iterations)
-boi = np.random.triangular(1.15, 1.20, 1.28, iterations)
+# ============================================================
+# المحرك الاحترافي لقراءة LIS/DLIS
+# ============================================================
+def read_well_file_pro(file_bytes, file_name):
+    tmp_path = None
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.lis') as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
 
-# Calculations
-ooip = (7758 * rock_volume * ntg * porosity * (1 - sw)) / boi
-recoverable_oil = ooip * rf
+    curves, metadata = {}, {}
+    well_info = {'well_name': 'UNKNOWN', 'method': 'UNKNOWN'}
+    
+    try:
+        files = dlisio.load(tmp_path)
+        parsed_files = list(files) if isinstance(files, tuple) else [files]
+        
+        for f in parsed_files:
+            well_info['method'] = "LIS/DLIS (Logical Parser)"
+            # استخراج اسم البئر من النصوص (Header)
+            if hasattr(f, 'text'):
+                for text_record in f.text:
+                    txt = text_record.text.decode('ascii', errors='ignore').strip()
+                    match = re.search(r'(?:WN|WELL|WELLNAME)\s+([A-Za-z0-9\-\/]+)', txt)
+                    if match: well_info['well_name'] = match.group(1).strip()
+            
+            # استخراج المنحنيات
+            log_passes = f.log_passes() if hasattr(f, 'log_passes') else []
+            for p in log_passes:
+                pass_data = p.curves()
+                if isinstance(pass_data, np.ndarray) and pass_data.dtype.names:
+                    for name in pass_data.dtype.names:
+                        unit = ""
+                        for spec in p.data_specs:
+                            if spec.mnemonic == name:
+                                unit = getattr(spec, 'units', '')
+                                break
+                        data = np.squeeze(pass_data[name])
+                        if data.ndim == 2: # تفكيك الـ Pads
+                            for i in range(data.shape[1]):
+                                curves[f"{name}_P{i+1}"] = data[:, i]
+                                metadata[f"{name}_P{i+1}"] = unit
+                        else:
+                            curves[name] = data
+                            metadata[name] = unit
+        
+        if not curves: return None, None, None, "لم يتم العثور على منحنيات."
+        return curves, metadata, well_info, None
+    except Exception as e:
+        return None, None, None, str(e)
+    finally:
+        if tmp_path: Path(tmp_path).unlink()
 
-# Convert to MMSTB for better x-axis readability
-recoverable_oil_mm = recoverable_oil / 1_000_000
+# ============================================================
+# دالة التحويل (مع محاذاة البيانات وتعديل الاسم)
+# ============================================================
+def convert_to_las(file_bytes, file_name, new_well_name):
+    try:
+        curves, metadata, well_info, error = read_well_file_pro(file_bytes, file_name)
+        if error: return None, error
+        
+        # محاذاة الأطوال
+        min_len = min(len(d) for d in curves.values())
+        las = lasio.LASFile()
+        las.well['WELL'] = lasio.HeaderItem('WELL', value=new_well_name)
+        
+        # إضافة العمق
+        depth_keys = [k for k in curves.keys() if k.upper() in ['DEPT', 'DEPTH', 'ADEPT', 'MD']]
+        depth_name = depth_keys[0] if depth_keys else None
+        
+        if depth_name:
+            las.append_curve('DEPT', curves[depth_name][:min_len], unit=metadata[depth_name])
+        else:
+            las.append_curve('DEPT', np.arange(min_len) * 0.1524, unit='m')
+            
+        for name, data in curves.items():
+            if name == depth_name: continue
+            las.append_curve(name, data[:min_len], unit=metadata.get(name, ''))
+            
+        output = io.StringIO()
+        las.write(output, version=2)
+        return output.getvalue().encode('utf-8'), None
+    except Exception as e:
+        return None, str(e)
 
-# Percentiles and Statistics (in MMSTB)
-rec_p90 = np.percentile(recoverable_oil_mm, 10)
-rec_p50 = np.percentile(recoverable_oil_mm, 50)
-rec_p10 = np.percentile(recoverable_oil_mm, 90)
-rec_mean = np.mean(recoverable_oil_mm)
-rec_std = np.std(recoverable_oil_mm)
-rec_cv = rec_std / rec_mean
-rec_skew = skew(recoverable_oil_mm)
+# ============================================================
+# واجهة المستخدم
+# ============================================================
+uploaded_file = st.file_uploader("ارفعي ملف LIS/DLIS", type=['lis', 'dlis'])
+new_name = st.text_input("أدخلي اسم البئر الجديد (NSTA Convention):", "110/13-12")
 
-ooip_p90 = np.percentile(ooip, 10)
-ooip_p50 = np.percentile(ooip, 50)
-ooip_p10 = np.percentile(ooip, 90)
-ooip_mean = np.mean(ooip)
-
-var_90 = np.percentile(recoverable_oil_mm, 10)
-var_95 = np.percentile(recoverable_oil_mm, 5)
-
-# ==========================================
-# 2. Print Report
-# ==========================================
-print("=" * 60)
-print("           VOLUMETRIC RISK ANALYSIS REPORT")
-print("=" * 60)
-print(f"Gross Rock Volume          : {rock_volume:,.2f} acre-ft")
-print(f"Number of iterations       : {iterations:,}")
-print()
-print("--- ORIGINAL OIL IN PLACE (OOIP) ---")
-print(f"P10 (Optimistic) : {ooip_p10:,.0f} STB")
-print(f"P50 (Most Likely): {ooip_p50:,.0f} STB")
-print(f"P90 (Conservative): {ooip_p90:,.0f} STB")
-print(f"Mean OOIP        : {ooip_mean:,.0f} STB")
-print()
-print("--- RECOVERABLE OIL (Million STB) ---")
-print(f"P10 (Optimistic) : {rec_p10:,.2f} MMSTB")
-print(f"P50 (Most Likely): {rec_p50:,.2f} MMSTB")
-print(f"P90 (Conservative): {rec_p90:,.2f} MMSTB")
-print(f"Mean             : {rec_mean:,.2f} MMSTB")
-print(f"Std Dev          : {rec_std:,.2f} MMSTB")
-print(f"CV (Risk)        : {rec_cv:.3f}")
-print(f"Skewness         : {rec_skew:.3f}")
-print()
-print("--- RISK METRICS (VaR) ---")
-print(f"Value at Risk (VaR 90%): {var_90:,.2f} MMSTB")
-print(f"Value at Risk (VaR 95%): {var_95:,.2f} MMSTB")
-print("=" * 60)
-
-# ==========================================
-# 3. Data Preparation for Plots
-# ==========================================
-df = pd.DataFrame({
-    'Net-to-Gross': ntg,
-    'Porosity': porosity,
-    'Water Saturation': sw,
-    'Recovery Factor': rf,
-    'Oil Formation Vol Factor': boi,
-    'Recoverable Oil (MMSTB)': recoverable_oil_mm
-})
-
-correlations = df.corr(method='spearman')['Recoverable Oil (MMSTB)'].drop('Recoverable Oil (MMSTB)')
-correlations_sorted = correlations.sort_values(key=abs)
-
-# ==========================================
-# 4. Professional Plotting (Fixed Layout)
-# ==========================================
-sns.set_theme(style="whitegrid", palette="muted")
-sns.set_context("notebook", font_scale=1.1)
-
-# Create figure and subplots using a more stable 2x3 layout
-fig, axs = plt.subplots(2, 3, figsize=(22, 12))
-fig.suptitle('PROFESSIONAL VOLUMETRIC RISK ANALYSIS - MONTE CARLO SIMULATION', fontsize=20, fontweight='bold', y=0.98)
-
-# Flatten axes for easier indexing
-ax1, ax2, ax3, ax4, ax5, ax6 = axs.flatten()
-
-# Formatting for MMSTB (e.g., "10.0" instead of "10,000,000")
-formatter = ticker.FuncFormatter(lambda x, p: f'{x:.1f}')
-
-# --- Plot 1: Histogram + KDE ---
-sns.histplot(recoverable_oil_mm, bins=80, kde=True, color='#2ab7ca', edgecolor='white', ax=ax1)
-ax1.axvline(rec_p90, color='#e91e63', linestyle='--', linewidth=2, label=f'P90: {rec_p90:.1f} MMSTB')
-ax1.axvline(rec_p50, color='#4caf50', linestyle='-', linewidth=2, label=f'P50: {rec_p50:.1f} MMSTB')
-ax1.axvline(rec_p10, color='#2196f3', linestyle='--', linewidth=2, label=f'P10: {rec_p10:.1f} MMSTB')
-ax1.axvline(rec_mean, color='#ff9800', linestyle=':', linewidth=2, label=f'Mean: {rec_mean:.1f} MMSTB')
-ax1.set_title('1. Probability Distribution with KDE', fontweight='bold', fontsize=12)
-ax1.set_xlabel('Recoverable Oil (MMSTB)', fontsize=11)
-ax1.set_ylabel('Frequency', fontsize=11)
-ax1.legend(fontsize=9)
-ax1.xaxis.set_major_formatter(formatter)
-ax1.xaxis.set_major_locator(ticker.MultipleLocator(2))  # Show a tick every 2 MMSTB
-ax1.tick_params(axis='x', labelsize=9)
-
-# --- Plot 2: Standard Cumulative ---
-sns.ecdfplot(recoverable_oil_mm, color='#673ab7', linewidth=3, ax=ax2)
-ax2.set_title('2. Standard Cumulative (Less Than)', fontweight='bold', fontsize=12)
-ax2.set_xlabel('Recoverable Oil (MMSTB)', fontsize=11)
-ax2.set_ylabel('Probability', fontsize=11)
-ax2.xaxis.set_major_formatter(formatter)
-ax2.xaxis.set_major_locator(ticker.MultipleLocator(2))
-ax2.tick_params(axis='x', labelsize=9)
-
-# --- Plot 3: Exceedance Probability ---
-sns.ecdfplot(recoverable_oil_mm, color='#ff9800', linewidth=3, complementary=True, ax=ax3)
-ax3.axhline(0.90, color='#e91e63', linestyle=':', alpha=0.7)
-ax3.axvline(rec_p90, color='#e91e63', linestyle='--', linewidth=1.5, label=f'P90: {rec_p90:.1f}')
-ax3.axhline(0.50, color='#4caf50', linestyle=':', alpha=0.7)
-ax3.axvline(rec_p50, color='#4caf50', linestyle='-', linewidth=1.5, label=f'P50: {rec_p50:.1f}')
-ax3.axhline(0.10, color='#2196f3', linestyle=':', alpha=0.7)
-ax3.axvline(rec_p10, color='#2196f3', linestyle='--', linewidth=1.5, label=f'P10: {rec_p10:.1f}')
-ax3.set_title('3. Exceedance Probability (Greater Than)', fontweight='bold', fontsize=12)
-ax3.set_xlabel('Recoverable Oil (MMSTB)', fontsize=11)
-ax3.set_ylabel('Probability', fontsize=11)
-ax3.legend(fontsize=9)
-ax3.xaxis.set_major_formatter(formatter)
-ax3.xaxis.set_major_locator(ticker.MultipleLocator(2))
-ax3.tick_params(axis='x', labelsize=9)
-
-# --- Plot 4: Correlation Heatmap ---
-corr_matrix = df.drop('Recoverable Oil (MMSTB)', axis=1).corr(method='spearman')
-sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, fmt='.2f', linewidths=0.5, ax=ax4, annot_kws={'size': 10})
-ax4.set_title('4. Spearman Correlation Heatmap (Input Variables)', fontweight='bold', fontsize=12)
-ax4.tick_params(axis='x', labelsize=9, rotation=45)
-ax4.tick_params(axis='y', labelsize=9)
-
-# --- Plot 5: Tornado Chart ---
-colors_tornado = ['#f44336' if x < 0 else '#4caf50' for x in correlations_sorted.values]
-ax5.barh(correlations_sorted.index, correlations_sorted.values, color=colors_tornado, edgecolor='black')
-ax5.axvline(0, color='black', linewidth=1)
-ax5.axvline(0.1, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
-ax5.axvline(-0.1, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
-ax5.set_title('5. Tornado Chart - Sensitivity Analysis', fontweight='bold', fontsize=12)
-ax5.set_xlabel('Spearman Correlation Coefficient', fontsize=11)
-ax5.set_xlim(-1, 1)
-ax5.tick_params(axis='both', labelsize=10)
-
-# Add correlation values on the bars
-for i, (var, val) in enumerate(correlations_sorted.items()):
-    ax5.text(val + (0.03 if val >= 0 else -0.09), i, f'{val:.2f}', va='center', fontweight='bold', fontsize=10)
-
-# --- Plot 6: Q-Q Plot ---
-probplot(recoverable_oil_mm, dist='norm', plot=ax6)
-ax6.set_title('6. Q-Q Plot vs Normal Distribution', fontweight='bold', fontsize=12)
-ax6.set_xlabel('Theoretical Quantiles', fontsize=11)
-ax6.set_ylabel('Sample Quantiles (MMSTB)', fontsize=11)
-ax6.tick_params(axis='both', labelsize=9)
-# Improve Q-Q plot style
-lines = ax6.get_lines()
-if len(lines) >= 1:
-    lines[0].set_marker('o')
-    lines[0].set_markersize(2)
-    lines[0].set_color('#2ab7ca')
-if len(lines) >= 2:
-    lines[1].set_color('#e91e63')
-    lines[1].set_linewidth(2)
-
-# --- Add Summary Text Box (Bottom Center) ---
-results_summary = f"""
-SUMMARY STATISTICS (Recoverable Oil, MMSTB):
-P10 (Optimistic): {rec_p10:.2f}
-P50 (Most Likely): {rec_p50:.2f}
-P90 (Conservative): {rec_p90:.2f}
-Mean: {rec_mean:.2f}
-Std Dev: {rec_std:.2f}
-CV: {rec_cv:.3f}
-Skewness: {rec_skew:.3f}
-VaR 90%: {var_90:.2f}
-VaR 95%: {var_95:.2f}
-"""
-
-fig.text(0.5, 0.01, results_summary, fontsize=9, ha='center',
-         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-# Final layout adjustments (no tight_layout to avoid warnings)
-plt.subplots_adjust(left=0.05, right=0.98, top=0.93, bottom=0.20, hspace=0.3, wspace=0.3)
-plt.show()
+if uploaded_file and st.button("تحويل"):
+    with st.spinner("جاري التحويل..."):
+        res, err = convert_to_las(uploaded_file.read(), uploaded_file.name, new_name)
+        if res:
+            st.success("تم التحويل بنجاح!")
+            st.download_button("تحميل ملف LAS", res, file_name=f"{new_name}.las")
+        else:
+            st.error(f"خطأ: {err}")
