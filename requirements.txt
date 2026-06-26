@@ -1,7 +1,6 @@
 streamlit
-pandas
+dlisio
+lasio
 numpy
-matplotlib
-seaborn
-scipy
-openpyxl
+pandas
+plotly
